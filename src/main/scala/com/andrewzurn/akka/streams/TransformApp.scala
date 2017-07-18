@@ -2,9 +2,12 @@ package com.andrewzurn.akka.streams
 
 import akka.Done
 import akka.actor.ActorSystem
+import akka.http.scaladsl.Http
+import akka.http.scaladsl.model.HttpRequest
 import akka.kafka.scaladsl._
 import akka.kafka._
 import akka.stream.ActorMaterializer
+import akka.util.ByteString
 import com.typesafe.config.ConfigFactory
 import org.apache.kafka.clients.producer.ProducerRecord
 import org.apache.kafka.common.serialization._
@@ -23,15 +26,9 @@ object TransformApp extends App {
   private implicit val actorSystem =
     ActorSystem("kafka-mirror-system", config)
 
-  private var currentRunning = 0
-
   try {
-    val producerSettings = ProducerSettings(actorSystem,
-                                            new ByteArraySerializer,
-                                            new StringSerializer)
-    val consumerSettings = ConsumerSettings(actorSystem,
-                                            new ByteArrayDeserializer,
-                                            new StringDeserializer)
+    val producerSettings = ProducerSettings(actorSystem, new ByteArraySerializer, new StringSerializer)
+    val consumerSettings = ConsumerSettings(actorSystem, new ByteArrayDeserializer, new StringDeserializer)
     implicit val actorMaterializer = ActorMaterializer()
 
     /**
@@ -41,29 +38,29 @@ object TransformApp extends App {
     val completion: Future[Done] =
       Consumer
         .committableSource(consumerSettings, Subscriptions.topics(inputTopic))
-        .mapAsync(2) { msg =>
-          currentRunning += 1
-          logger.info(s"Got message: ${msg.record.value()}. Current running: $currentRunning.")
-          val fut = Future {
-            /**
-              * Basically copy from one topic to another.
-              *
-              * Note input timestamp may be -1 but output timestamp
-              * cannot be -1!
-              */
-            val newTimestamp: java.lang.Long = {
-              if (msg.record.timestamp() < 0) null
-              else msg.record.timestamp()
+        .mapAsync(4) { msg =>
+          Http().singleRequest(HttpRequest(uri = "http://localhost:8080/hello"))
+            .flatMap { result =>
+              val bodyFuture = result.entity.dataBytes.runFold(ByteString(""))(_ ++ _).map { body =>
+                logger.info("Got response, body: " + body.utf8String)
+                body
+              }
+
+              bodyFuture map { body =>
+                val newTimestamp: java.lang.Long = {
+                  if (msg.record.timestamp() < 0) null
+                  else msg.record.timestamp()
+                }
+                ProducerMessage.Message(new ProducerRecord(
+                  outputTopic,
+                  null,
+                  newTimestamp,
+                  msg.record.key,
+                  "Produced message: " + msg.record.value + " -- " + body.utf8String
+                ),
+                  msg.committableOffset)
+              }
             }
-            ProducerMessage.Message(new ProducerRecord(
-              outputTopic,
-              null,
-              newTimestamp,
-              msg.record.key,
-              msg.record.value
-            ),
-              msg.committableOffset)
-          }
         }
         .runWith(Producer.commitableSink(producerSettings))
 
